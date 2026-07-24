@@ -31,11 +31,23 @@ Repository: <https://github.com/wangyifan349/xfm4-secure-mux>
 
 ```text
 xfm4-secure-mux/
-├── secure_mux_server.py    # XFM4 server
-├── secure_mux_client.py    # XFM4 client
-├── README.md               # English documentation
-└── README.zh-CN.md         # Chinese documentation
+├── secure_mux_server.py         # XFM4 server
+├── secure_mux_client.py         # XFM4 client
+├── README.md                    # English documentation
+├── README.zh-CN.md              # Chinese documentation
+├── encryption-decryption-flow.png      # Encryption / decryption diagram
+└── data-flow-multiplexing.png    # Data flow / multiplexing diagram
 ```
+
+## 🖼️ Architecture Diagrams
+
+### Encryption and decryption logic
+
+![Encryption and decryption logic](encryption-decryption-flow.png)
+
+### Data flow and multiplexing
+
+![Data flow and multiplexing](data-flow-multiplexing.png)
 
 ## 📋 Requirements
 

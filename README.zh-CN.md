@@ -31,11 +31,23 @@ XFM4 SecureMux 是一个基于 Python 的双向加密通信工具。在一条 TC
 
 ```text
 xfm4-secure-mux/
-├── secure_mux_server.py    # XFM4 服务端
-├── secure_mux_client.py    # XFM4 客户端
-├── README.md               # English documentation
-└── README.zh-CN.md         # 中文文档
+├── secure_mux_server.py         # XFM4 服务端
+├── secure_mux_client.py         # XFM4 客户端
+├── README.md                    # English documentation
+├── README.zh-CN.md              # 中文文档
+├── encryption-decryption-flow.png      # 加密 / 解密流程图
+└── data-flow-multiplexing.png    # 数据流 / 多路复用流程图
 ```
+
+## 🖼️ 架构图
+
+### 加密与解密逻辑
+
+![加密与解密逻辑](encryption-decryption-flow.png)
+
+### 数据流与多路复用
+
+![数据流与多路复用](data-flow-multiplexing.png)
 
 ## 📋 环境要求
 
