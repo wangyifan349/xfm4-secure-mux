@@ -591,13 +591,32 @@ When changing the wire protocol, update all of the following together:
 
 The client and server must use compatible protocol identifiers, packet layouts, and key-derivation parameters. Otherwise, the handshake or subsequent packet parsing will fail.
 
+## 📬 Contact and Collaboration
 
-## 📬 Contact & Collaboration
+If you encounter a problem, discover a bug, or have a suggestion for improving the project, you are welcome to contact the author. 🛠️
 
-Found a bug, have a suggestion, or want to improve the project? Feel free to contact the author. 🤝 Collaboration is also welcome in areas such as Rust, Python 3, network communication, protocol design, secure file transfer, cloud storage, backend systems, cross-platform tools, and open-source development.
+🤝 The author is also open to technical collaboration and is currently looking for developers and partners interested in building practical software projects together.
 
-📧 [wangyifan1999@protonmail.com](mailto:wangyifan1999@protonmail.com)
-📧 [wangyifan349@gmail.com](mailto:wangyifan349@gmail.com)
+Potential areas of collaboration include: 🚀
 
-For technical issues, please include your operating system, Python version, command, logs, and reproduction steps. For collaboration, briefly introduce your background and project idea.
+* 🦀 Rust and Python 3 development
+* 🌐 Network communication and protocol design
+* 🔒 Secure messaging and file-transfer systems
+* ☁️ Cloud storage and distributed storage
+* ⚙️ Backend services and infrastructure
+* 💻 Cross-platform tools for Windows and Linux
+* 🚀 Performance optimization and system architecture
+* 🌍 Open-source project development
+
+Other technically valuable ideas and project proposals are also welcome. 💡 Collaboration may include improving XFM4 SecureMux, contributing new features, designing new protocols, or developing separate projects together.
+
+📧 Contact:
+
+* [wangyifan1999@protonmail.com](mailto:wangyifan1999@protonmail.com)
+* [wangyifan349@gmail.com](mailto:wangyifan349@gmail.com)
+
+When reporting a technical issue, please include your operating system, Python version, startup command, relevant logs, and reproduction steps where possible. 📝
+
+When proposing a collaboration, please briefly introduce yourself and describe your technical background, project idea, expected form of collaboration, and the areas you would like to work on. 🤝
+
 
