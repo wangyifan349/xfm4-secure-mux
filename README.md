@@ -592,11 +592,12 @@ When changing the wire protocol, update all of the following together:
 The client and server must use compatible protocol identifiers, packet layouts, and key-derivation parameters. Otherwise, the handshake or subsequent packet parsing will fail.
 
 
-## 📬 Contact
+## 📬 Contact & Collaboration
 
-If you encounter a problem, discover a bug, or have a suggestion for the project, you are welcome to contact the author:
+Found a bug, have a suggestion, or want to improve the project? Feel free to contact the author. 🤝 Collaboration is also welcome in areas such as Rust, Python 3, network communication, protocol design, secure file transfer, cloud storage, backend systems, cross-platform tools, and open-source development.
 
-* [wangyifan1999@protonmail.com](mailto:wangyifan1999@protonmail.com)
-* [wangyifan349@gmail.com](mailto:wangyifan349@gmail.com)
+📧 [wangyifan1999@protonmail.com](mailto:wangyifan1999@protonmail.com)
+📧 [wangyifan349@gmail.com](mailto:wangyifan349@gmail.com)
 
-When reporting an issue, please include your operating system, Python version, command-line arguments, relevant log output, and clear reproduction steps where possible.
+For technical issues, please include your operating system, Python version, command, logs, and reproduction steps. For collaboration, briefly introduce your background and project idea.
+
