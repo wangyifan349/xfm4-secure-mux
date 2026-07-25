@@ -590,3 +590,13 @@ When changing the wire protocol, update all of the following together:
 - Protocol documentation in both README files
 
 The client and server must use compatible protocol identifiers, packet layouts, and key-derivation parameters. Otherwise, the handshake or subsequent packet parsing will fail.
+
+
+## 📬 Contact
+
+If you encounter a problem, discover a bug, or have a suggestion for the project, you are welcome to contact the author:
+
+* [wangyifan1999@protonmail.com](mailto:wangyifan1999@protonmail.com)
+* [wangyifan349@gmail.com](mailto:wangyifan349@gmail.com)
+
+When reporting an issue, please include your operating system, Python version, command-line arguments, relevant log output, and clear reproduction steps where possible.
