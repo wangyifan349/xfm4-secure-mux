@@ -2,15 +2,19 @@
 from __future__ import annotations
 
 import argparse
+import glob
+import ipaddress
 import hashlib
 import os
 import queue
+import selectors
 import shlex
 import socket
 import struct
 import threading
 import time
 from collections import deque
+from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import BinaryIO, Callable, Deque, Dict, Iterable, List, Optional, Tuple
@@ -73,21 +77,21 @@ def recv_exact(sock: socket.socket, size: int) -> bytes:
     while len(data) < size:
         chunk = sock.recv(size - len(data))
         if not chunk:
-            raise ConnectionClosed("连接已关闭")
+            raise ConnectionClosed("Connection closed")
         data.extend(chunk)
     return bytes(data)
 
 
 def send_frame(sock: socket.socket, payload: bytes) -> None:
     if not payload or len(payload) > MAX_FRAME_SIZE:
-        raise ProtocolError(f"非法帧长度: {len(payload)}")
+        raise ProtocolError(f"Invalid frame length: {len(payload)}")
     sock.sendall(FRAME_LENGTH.pack(len(payload)) + payload)
 
 
 def recv_frame(sock: socket.socket) -> bytes:
     length = FRAME_LENGTH.unpack(recv_exact(sock, FRAME_LENGTH.size))[0]
     if length == 0 or length > MAX_FRAME_SIZE:
-        raise ProtocolError(f"非法帧长度: {length}")
+        raise ProtocolError(f"Invalid frame length: {length}")
     return recv_exact(sock, length)
 
 
@@ -124,7 +128,7 @@ def derive_session_material(
 
 def nonce_from_sequence(sequence: int) -> bytes:
     if sequence < 0 or sequence >= (1 << 64):
-        raise OverflowError("消息序号已耗尽")
+        raise OverflowError("Message sequence exhausted")
     return b"\x00\x00\x00\x00" + SEQUENCE.pack(sequence)
 
 
@@ -143,6 +147,97 @@ def sanitize_filename(name: str) -> str:
     if cleaned in {"", ".", ".."}:
         return "received-file.bin"
     return cleaned
+
+
+def strip_wrapping_quotes(value: str) -> str:
+    stripped = value.strip()
+    if len(stripped) < 2:
+        return stripped
+    first = stripped[0]
+    last = stripped[-1]
+    if first == last and first in {"\"", "'"}:
+        return stripped[1:-1]
+    return stripped
+
+
+def split_command_line(command_line: str) -> List[str]:
+    posix_mode = os.name != "nt"
+    parsed = shlex.split(command_line, posix=posix_mode)
+    cleaned: List[str] = []
+    for item in parsed:
+        cleaned.append(strip_wrapping_quotes(item))
+    return cleaned
+
+
+def resolve_path_expression(expression: str) -> Tuple[List[Path], str]:
+    cleaned = strip_wrapping_quotes(expression)
+    if not cleaned:
+        return [], "Empty path expression"
+
+    expanded = os.path.expandvars(os.path.expanduser(cleaned))
+    matches: List[Path] = []
+
+    if glob.has_magic(expanded):
+        raw_matches = glob.glob(expanded)
+        raw_matches.sort()
+        for raw_match in raw_matches:
+            candidate = Path(raw_match).resolve(strict=False)
+            if candidate.is_file():
+                matches.append(candidate)
+        if matches:
+            return matches, ""
+        return [], f"No files matched pattern: {cleaned}"
+
+    candidate = Path(expanded).resolve(strict=False)
+    if candidate.is_file():
+        matches.append(candidate)
+        return matches, ""
+    if candidate.exists():
+        return [], f"Path is not a regular file: {candidate}"
+    return [], f"File not found: {candidate} (working directory: {Path.cwd()})"
+
+
+def resolve_send_paths(arguments: Iterable[str]) -> Tuple[List[Path], List[str]]:
+    tokens: List[str] = []
+    for argument in arguments:
+        cleaned = strip_wrapping_quotes(str(argument))
+        if cleaned:
+            tokens.append(cleaned)
+
+    resolved: List[Path] = []
+    errors: List[str] = []
+    seen: set[str] = set()
+    index = 0
+
+    while index < len(tokens):
+        best_paths: List[Path] = []
+        best_end = index
+        end = index + 1
+
+        while end <= len(tokens):
+            expression = " ".join(tokens[index:end])
+            candidates, error = resolve_path_expression(expression)
+            if candidates:
+                best_paths = candidates
+                best_end = end
+                break
+            end += 1
+
+        if not best_paths:
+            unused_candidates, error = resolve_path_expression(tokens[index])
+            errors.append(error)
+            index += 1
+            continue
+
+        for candidate in best_paths:
+            identity = os.path.normcase(str(candidate))
+            if identity in seen:
+                continue
+            seen.add(identity)
+            resolved.append(candidate)
+        index = best_end
+
+    return resolved, errors
 
 
 def unique_path(directory: Path, filename: str) -> Path:
@@ -170,22 +265,93 @@ def decode_reason(payload: bytes) -> str:
         return ""
     length = struct.unpack("!H", payload[:2])[0]
     if len(payload) != 2 + length:
-        raise ProtocolError("原因字段长度错误")
+        raise ProtocolError("Invalid reason-field length")
     return payload[2:].decode("utf-8", errors="replace")
 
 
+class LocalLog:
+    def __init__(self, directory: Path) -> None:
+        directory.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        self.path = directory / f"chat_{timestamp}.log"
+        self._file = self.path.open("a", encoding="utf-8", buffering=1)
+        self._lock = threading.Lock()
+
+    def write(self, message: str) -> None:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        lines = message.splitlines()
+        if not lines:
+            lines = [""]
+        with self._lock:
+            if self._file.closed:
+                return
+            for line in lines:
+                self._file.write(f"[{timestamp}] {line}\n")
+            self._file.flush()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._file.closed:
+                return
+            self._file.close()
+
+
 class Console:
-    def __init__(self, prompt: str) -> None:
+    def __init__(self, prompt: str, local_log: LocalLog) -> None:
         self.prompt = prompt
+        self.local_log = local_log
         self._lock = threading.Lock()
 
     def write(self, message: str) -> None:
         with self._lock:
             print(message, flush=True)
+            self.local_log.write(message)
 
     def async_write(self, message: str) -> None:
         with self._lock:
             print(f"\r{message}\n{self.prompt}", end="", flush=True)
+            self.local_log.write(message)
+
+    def record_input(self, line: str) -> None:
+        self.local_log.write(f"{self.prompt}{line}")
+
+
+def normalize_ip_address(address: object) -> str:
+    if isinstance(address, tuple) and address:
+        host = str(address[0])
+    else:
+        host = str(address)
+
+    scope_index = host.find("%")
+    address_without_scope = host
+    if scope_index >= 0:
+        address_without_scope = host[:scope_index]
+
+    try:
+        parsed = ipaddress.ip_address(address_without_scope)
+    except ValueError:
+        return host
+
+    if isinstance(parsed, ipaddress.IPv6Address) and parsed.ipv4_mapped is not None:
+        return str(parsed.ipv4_mapped)
+    return host
+
+
+def format_endpoint(address: object) -> str:
+    if not isinstance(address, tuple) or len(address) < 2:
+        return str(address)
+    host = normalize_ip_address(address)
+    port = address[1]
+    if ":" in host:
+        return f"[{host}]:{port}"
+    return f"{host}:{port}"
+
+
+def strip_ipv6_brackets(host: str) -> str:
+    stripped = host.strip()
+    if stripped.startswith("[") and stripped.endswith("]"):
+        return stripped[1:-1]
+    return stripped
 
 
 class EncryptedChannel:
@@ -198,7 +364,7 @@ class EncryptedChannel:
 
     def send_packet(self, plaintext: bytes) -> None:
         if not plaintext or len(plaintext) > MAX_PACKET_PAYLOAD:
-            raise ProtocolError(f"非法明文包长度: {len(plaintext)}")
+            raise ProtocolError(f"Invalid plaintext packet length: {len(plaintext)}")
         sequence_bytes = SEQUENCE.pack(self._send_sequence)
         nonce = nonce_from_sequence(self._send_sequence)
         ciphertext = self._send_cipher.encrypt(
@@ -212,13 +378,13 @@ class EncryptedChannel:
     def receive_packet(self) -> bytes:
         frame = recv_frame(self.sock)
         if len(frame) < SEQUENCE.size + AEAD_TAG_SIZE:
-            raise ProtocolError("加密帧过短")
+            raise ProtocolError("Encrypted frame is too short")
 
         sequence_bytes = frame[:SEQUENCE.size]
         sequence = SEQUENCE.unpack(sequence_bytes)[0]
         if sequence != self._receive_sequence:
             raise ProtocolError(
-                f"消息序号错误，期望 {self._receive_sequence}，收到 {sequence}"
+                f"Invalid message sequence: expected {self._receive_sequence}, received {sequence}"
             )
 
         try:
@@ -228,11 +394,11 @@ class EncryptedChannel:
                 PROTOCOL_MAGIC + sequence_bytes,
             )
         except InvalidTag as exc:
-            raise ProtocolError("消息认证失败") from exc
+            raise ProtocolError("Message authentication failed") from exc
 
         self._receive_sequence += 1
         if not plaintext or len(plaintext) > MAX_PACKET_PAYLOAD:
-            raise ProtocolError("解密后的数据包长度非法")
+            raise ProtocolError("Invalid decrypted packet length")
         return plaintext
 
 
@@ -282,7 +448,7 @@ class SendManager:
             return False
         packet = PACKET_HEADER.pack(packet_type, stream_id) + payload
         if len(packet) > MAX_PACKET_PAYLOAD:
-            raise ProtocolError("协议包超过最大长度")
+            raise ProtocolError("Protocol packet exceeds the maximum length")
 
         with self._counter_lock:
             order = self._counter
@@ -391,15 +557,26 @@ class TransferManager:
         self._scheduler.start()
 
     def add_files(self, paths: Iterable[str]) -> List[int]:
+        resolved_paths, path_errors = resolve_send_paths(paths)
+        for path_error in path_errors:
+            self.console.write(f"Skipped: {path_error}")
+
+        if not resolved_paths:
+            self.console.write(
+                "No valid files were found. Quote paths containing spaces, or use a wildcard pattern."
+            )
+            return []
+
         stream_ids: List[int] = []
         with self._condition:
-            for raw_path in paths:
-                path = Path(raw_path).expanduser().resolve()
-                if not path.exists():
-                    self.console.write(f"文件不存在: {path}")
+            for path in resolved_paths:
+                try:
+                    file_stat = path.stat()
+                except OSError as exc:
+                    self.console.write(f"Skipped unreadable path: {path}: {exc}")
                     continue
                 if not path.is_file():
-                    self.console.write(f"不是普通文件: {path}")
+                    self.console.write(f"Skipped non-file path: {path}")
                     continue
 
                 stream_id = self._next_stream_id
@@ -407,20 +584,25 @@ class TransferManager:
                 transfer = OutboundTransfer(
                     stream_id=stream_id,
                     path=path,
-                    size=path.stat().st_size,
+                    size=file_stat.st_size,
                     chunk_size=self.chunk_size,
                 )
                 self._outbound[stream_id] = transfer
                 self._schedule.append(stream_id)
                 stream_ids.append(stream_id)
                 self.console.write(
-                    f"已加入发送队列: 0x{stream_id:016x} | {path.name} | "
+                    f"Queued file: 0x{stream_id:016x} | {path.name} | "
                     f"{format_size(transfer.size)}"
                 )
             self._condition.notify_all()
+
+        if stream_ids:
+            self.console.write(
+                f"Queued {len(stream_ids)} file(s) for multiplexed round-robin transfer."
+            )
         return stream_ids
 
-    def cancel_outbound(self, stream_id: int, reason: str = "本地用户取消") -> bool:
+    def cancel_outbound(self, stream_id: int, reason: str = "Cancelled by local user") -> bool:
         with self._lock:
             transfer = self._outbound.get(stream_id)
             if transfer is None or transfer.state in {"complete", "cancelled", "failed"}:
@@ -441,7 +623,7 @@ class TransferManager:
             encode_reason(reason),
             PRIORITY_CONTROL,
         )
-        self.console.async_write(f"已取消发送流 0x{stream_id:016x}: {reason}")
+        self.console.async_write(f"Cancelled outbound stream 0x{stream_id:016x}: {reason}")
         return True
 
     def handle_remote_cancel(self, stream_id: int, reason: str) -> None:
@@ -449,7 +631,7 @@ class TransferManager:
             outbound = self._outbound.get(stream_id)
             if outbound is not None and outbound.state not in {"complete", "cancelled", "failed"}:
                 outbound.state = "cancelled"
-                outbound.error = reason or "对端取消"
+                outbound.error = reason or "Cancelled by peer"
                 if outbound.file_handle is not None:
                     try:
                         outbound.file_handle.close()
@@ -458,69 +640,83 @@ class TransferManager:
                     outbound.file_handle = None
                 self.send_manager.mark_stream_cancelled(stream_id)
                 self.console.async_write(
-                    f"对端取消了发送流 0x{stream_id:016x}: {outbound.error}"
+                    f"Peer cancelled outbound stream 0x{stream_id:016x}: {outbound.error}"
                 )
                 return
 
             incoming = self._incoming.get(stream_id)
             if incoming is not None:
                 incoming.state = "cancelled"
-                incoming.error = reason or "对端取消"
+                incoming.error = reason or "Cancelled by peer"
                 incoming.cancel_event.set()
                 self._put_incoming_task(incoming, ("cancel", incoming.error))
 
     def handle_ack(self, stream_id: int, payload: bytes) -> None:
         if len(payload) < FILE_ACK_FIXED.size:
-            raise ProtocolError("FILE_ACK 过短")
-        status, digest, message_length = FILE_ACK_FIXED.unpack(
+            raise ProtocolError("FILE_ACK is too short")
+        status, remote_digest, message_length = FILE_ACK_FIXED.unpack(
             payload[:FILE_ACK_FIXED.size]
         )
         message = payload[FILE_ACK_FIXED.size:]
         if len(message) != message_length:
-            raise ProtocolError("FILE_ACK 消息长度错误")
+            raise ProtocolError("Invalid FILE_ACK message length")
         text = message.decode("utf-8", errors="replace")
 
         with self._lock:
             transfer = self._outbound.get(stream_id)
             if transfer is None:
-                raise ProtocolError(f"未知 FILE_ACK 流: 0x{stream_id:016x}")
-            if status == 0 and transfer.digest == digest:
+                raise ProtocolError(f"Unknown FILE_ACK stream: 0x{stream_id:016x}")
+
+            local_digest = transfer.digest
+            local_hash = local_digest.hex() if local_digest is not None else "unavailable"
+            remote_hash = remote_digest.hex()
+            hashes_match = local_digest is not None and local_digest == remote_digest
+
+            hash_report = (
+                f"SHA-256 result for outbound stream 0x{stream_id:016x}:\n"
+                f"  Expected (sender): {local_hash}\n"
+                f"  Actual (receiver): {remote_hash}"
+            )
+
+            if status == 0 and hashes_match:
                 transfer.state = "complete"
                 elapsed = max(time.monotonic() - transfer.started_at, 0.001)
                 speed = transfer.size / elapsed
                 summary = (
-                    f"发送完成: 0x{stream_id:016x} | {transfer.path.name} | "
-                    f"{format_size(transfer.size)} | 平均 {format_size(int(speed))}/s"
+                    f"Send complete: 0x{stream_id:016x} | {transfer.path.name} | "
+                    f"{format_size(transfer.size)} | average {format_size(int(speed))}/s | "
+                    f"SHA-256 verified"
                 )
             else:
                 transfer.state = "failed"
-                transfer.error = text or "接收端校验失败"
+                transfer.error = text or "Receiver verification failed"
                 summary = (
-                    f"发送失败: 0x{stream_id:016x} | {transfer.path.name} | "
+                    f"Send failed: 0x{stream_id:016x} | {transfer.path.name} | "
                     f"{transfer.error}"
                 )
             self._history.append(summary)
-        self.console.async_write(summary)
+
+        self.console.async_write(f"{hash_report}\n{summary}")
 
     def handle_file_start(self, stream_id: int, payload: bytes) -> None:
         if stream_id == 0 or stream_id % 2 != self.peer_stream_parity:
-            raise ProtocolError(f"非法对端 stream_id: 0x{stream_id:016x}")
+            raise ProtocolError(f"Invalid peer stream_id: 0x{stream_id:016x}")
         if len(payload) < FILE_START_FIXED.size:
-            raise ProtocolError("FILE_START 过短")
+            raise ProtocolError("FILE_START is too short")
 
         declared_size, chunk_size, name_length = FILE_START_FIXED.unpack(
             payload[:FILE_START_FIXED.size]
         )
         name_bytes = payload[FILE_START_FIXED.size:]
         if len(name_bytes) != name_length:
-            raise ProtocolError("FILE_START 文件名长度错误")
+            raise ProtocolError("Invalid FILE_START filename length")
         if chunk_size < MIN_CHUNK_SIZE or chunk_size > MAX_CHUNK_SIZE:
-            raise ProtocolError(f"非法分块大小: {chunk_size}")
+            raise ProtocolError(f"Invalid chunk size: {chunk_size}")
         filename = sanitize_filename(name_bytes.decode("utf-8", errors="replace"))
 
         with self._lock:
             if stream_id in self._incoming or stream_id in self._outbound:
-                raise ProtocolError(f"重复 stream_id: 0x{stream_id:016x}")
+                raise ProtocolError(f"Duplicate stream_id: 0x{stream_id:016x}")
             final_path = unique_path(self.download_dir, filename)
             temporary_path = unique_path(
                 self.download_dir,
@@ -546,48 +742,48 @@ class TransferManager:
             worker.start()
 
         self.console.async_write(
-            f"开始接收: 0x{stream_id:016x} | {filename} | "
+            f"Receiving file: 0x{stream_id:016x} | {filename} | "
             f"{format_size(declared_size)}"
         )
 
     def handle_file_chunk(self, stream_id: int, payload: bytes) -> None:
         if len(payload) < FILE_CHUNK_FIXED.size:
-            raise ProtocolError("FILE_CHUNK 过短")
+            raise ProtocolError("FILE_CHUNK is too short")
         offset = FILE_CHUNK_FIXED.unpack(payload[:FILE_CHUNK_FIXED.size])[0]
         chunk = payload[FILE_CHUNK_FIXED.size:]
         if not chunk:
-            raise ProtocolError("FILE_CHUNK 为空")
+            raise ProtocolError("FILE_CHUNK is empty")
 
         with self._lock:
             transfer = self._incoming.get(stream_id)
             if transfer is None or transfer.state != "receiving":
-                raise ProtocolError(f"未知或已结束的接收流: 0x{stream_id:016x}")
+                raise ProtocolError(f"Unknown or closed inbound stream: 0x{stream_id:016x}")
             if offset != transfer.expected_offset:
                 raise ProtocolError(
-                    f"文件偏移错误，流 0x{stream_id:016x} 期望 "
-                    f"{transfer.expected_offset}，收到 {offset}"
+                    f"Invalid file offset for stream 0x{stream_id:016x}: expected "
+                    f"{transfer.expected_offset}, received {offset}"
                 )
             if len(chunk) > transfer.chunk_size:
-                raise ProtocolError("文件块超过协商大小")
+                raise ProtocolError("File chunk exceeds the negotiated chunk size")
             if offset + len(chunk) > transfer.declared_size:
-                raise ProtocolError("文件块超过声明大小")
+                raise ProtocolError("File chunk exceeds the declared file size")
             transfer.expected_offset += len(chunk)
 
         self._put_incoming_task(transfer, ("chunk", chunk))
 
     def handle_file_end(self, stream_id: int, payload: bytes) -> None:
         if len(payload) != FILE_END_FIXED.size:
-            raise ProtocolError("FILE_END 长度错误")
+            raise ProtocolError("Invalid FILE_END length")
         total_size, expected_digest = FILE_END_FIXED.unpack(payload)
         with self._lock:
             transfer = self._incoming.get(stream_id)
             if transfer is None or transfer.state != "receiving":
-                raise ProtocolError(f"未知或已结束的接收流: 0x{stream_id:016x}")
+                raise ProtocolError(f"Unknown or closed inbound stream: 0x{stream_id:016x}")
             if total_size != transfer.declared_size:
-                raise ProtocolError("FILE_END 大小与 FILE_START 不一致")
+                raise ProtocolError("FILE_END size does not match FILE_START")
             if transfer.expected_offset != total_size:
                 raise ProtocolError(
-                    f"FILE_END 到达时数据不完整: {transfer.expected_offset}/{total_size}"
+                    f"Incomplete file data at FILE_END: {transfer.expected_offset}/{total_size}"
                 )
             transfer.state = "verifying"
         self._put_incoming_task(transfer, ("end", total_size, expected_digest))
@@ -599,7 +795,7 @@ class TransferManager:
                 item = self._outbound[stream_id]
                 percent = 100.0 if item.size == 0 else (item.offset * 100.0 / item.size)
                 lines.append(
-                    f"发送 0x{stream_id:016x} | {item.state:11s} | "
+                    f"outbound 0x{stream_id:016x} | {item.state:11s} | "
                     f"{percent:6.2f}% | {item.path.name}"
                 )
             for stream_id in sorted(self._incoming):
@@ -608,13 +804,13 @@ class TransferManager:
                     item.expected_offset * 100.0 / item.declared_size
                 )
                 lines.append(
-                    f"接收 0x{stream_id:016x} | {item.state:11s} | "
+                    f"inbound  0x{stream_id:016x} | {item.state:11s} | "
                     f"{percent:6.2f}% | {item.filename}"
                 )
             if self._history:
-                lines.append("最近完成记录:")
+                lines.append("Recent transfer history:")
                 lines.extend(f"  {entry}" for entry in list(self._history)[-5:])
-        return lines or ["当前没有文件传输任务"]
+        return lines or ["No active file transfers"]
 
     def shutdown(self) -> None:
         with self._lock:
@@ -628,7 +824,7 @@ class TransferManager:
             incoming = list(self._incoming.values())
         for transfer in incoming:
             transfer.cancel_event.set()
-            self._put_incoming_task(transfer, ("cancel", "连接关闭"), block=False)
+            self._put_incoming_task(transfer, ("cancel", "Connection closed"), block=False)
 
     def _scheduler_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -662,7 +858,7 @@ class TransferManager:
                     PRIORITY_CONTROL,
                 )
                 self.console.async_write(
-                    f"读取文件失败 0x{stream_id:016x}: {transfer.path.name}: {exc}"
+                    f"Failed to read file for stream 0x{stream_id:016x}: {transfer.path.name}: {exc}"
                 )
                 should_reschedule = False
 
@@ -680,7 +876,7 @@ class TransferManager:
                 transfer.file_handle = transfer.path.open("rb")
                 filename = transfer.path.name.encode("utf-8")
                 if len(filename) > 65535:
-                    raise ValueError("文件名过长")
+                    raise ValueError("Filename is too long")
                 payload = FILE_START_FIXED.pack(
                     transfer.size,
                     transfer.chunk_size,
@@ -697,7 +893,7 @@ class TransferManager:
                 return True
 
             if transfer.file_handle is None:
-                raise OSError("发送文件句柄不可用")
+                raise OSError("Outbound file handle is unavailable")
             chunk = transfer.file_handle.read(transfer.chunk_size)
             if chunk:
                 offset = transfer.offset
@@ -716,7 +912,16 @@ class TransferManager:
 
             transfer.file_handle.close()
             transfer.file_handle = None
+            if transfer.offset != transfer.size:
+                raise OSError(
+                    f"File size changed during transfer: expected {transfer.size}, "
+                    f"read {transfer.offset}"
+                )
             transfer.digest = transfer.hasher.digest()
+            self.console.async_write(
+                f"Final SHA-256 for outbound stream 0x{transfer.stream_id:016x}: "
+                f"{transfer.digest.hex()}"
+            )
             payload = FILE_END_FIXED.pack(transfer.size, transfer.digest)
             if not self.send_manager.enqueue(
                 TYPE_FILE_END,
@@ -737,7 +942,7 @@ class TransferManager:
         if bucket > transfer.last_reported_percent:
             transfer.last_reported_percent = bucket
             self.console.async_write(
-                f"发送进度 0x{transfer.stream_id:016x}: {transfer.path.name} "
+                f"Send progress 0x{transfer.stream_id:016x}: {transfer.path.name} "
                 f"{percent}% ({format_size(transfer.offset)}/{format_size(transfer.size)})"
             )
 
@@ -759,6 +964,7 @@ class TransferManager:
     def _incoming_writer_loop(self, transfer: IncomingTransfer) -> None:
         hasher = hashlib.sha256()
         file_handle: Optional[BinaryIO] = None
+        actual_digest = b"\x00" * 32
         try:
             file_handle = transfer.temporary_path.open("xb")
             while not self.stop_event.is_set() and not transfer.cancel_event.is_set():
@@ -772,49 +978,62 @@ class TransferManager:
                     file_handle.write(data)
                     hasher.update(data)
                     transfer.written += len(data)
-                elif kind == "end":
-                    total_size, expected_digest = task[1], task[2]
-                    actual_digest = hasher.digest()
-                    if transfer.written != total_size:
-                        raise ProtocolError(
-                            f"落盘大小不一致: {transfer.written}/{total_size}"
-                        )
-                    if actual_digest != expected_digest:
-                        raise ProtocolError("SHA-256 校验失败")
-                    file_handle.flush()
-                    os.fsync(file_handle.fileno())
-                    file_handle.close()
-                    file_handle = None
-                    os.replace(transfer.temporary_path, transfer.final_path)
-                    with self._lock:
-                        transfer.state = "complete"
-                        summary = (
-                            f"接收完成: 0x{transfer.stream_id:016x} | "
-                            f"{transfer.final_path.name} | {format_size(total_size)} | "
-                            f"保存至 {transfer.final_path}"
-                        )
-                        self._history.append(summary)
-                    message = str(transfer.final_path.name).encode("utf-8")[:4096]
-                    ack = FILE_ACK_FIXED.pack(0, actual_digest, len(message)) + message
-                    self.send_manager.enqueue(
-                        TYPE_FILE_ACK,
-                        transfer.stream_id,
-                        ack,
-                        PRIORITY_CONTROL,
-                    )
-                    self.console.async_write(summary)
-                    return
-                elif kind == "cancel":
+                    continue
+                if kind == "cancel":
                     transfer.error = str(task[1])
                     transfer.state = "cancelled"
                     return
-                else:
-                    raise ProtocolError(f"未知写入任务: {kind}")
+                if kind != "end":
+                    raise ProtocolError(f"Unknown writer task: {kind}")
+
+                total_size = task[1]
+                expected_digest = task[2]
+                actual_digest = hasher.digest()
+                expected_hash = expected_digest.hex()
+                actual_hash = actual_digest.hex()
+                self.console.async_write(
+                    f"SHA-256 verification for inbound stream 0x{transfer.stream_id:016x}:\n"
+                    f"  Expected (sender): {expected_hash}\n"
+                    f"  Actual (receiver): {actual_hash}"
+                )
+
+                if transfer.written != total_size:
+                    raise ProtocolError(
+                        f"Written size mismatch: {transfer.written}/{total_size}"
+                    )
+                if actual_digest != expected_digest:
+                    raise ProtocolError(
+                        f"SHA-256 mismatch: expected {expected_hash}, actual {actual_hash}"
+                    )
+
+                file_handle.flush()
+                os.fsync(file_handle.fileno())
+                file_handle.close()
+                file_handle = None
+                os.replace(transfer.temporary_path, transfer.final_path)
+                with self._lock:
+                    transfer.state = "complete"
+                    summary = (
+                        f"Receive complete: 0x{transfer.stream_id:016x} | "
+                        f"{transfer.final_path.name} | {format_size(total_size)} | "
+                        f"SHA-256 verified | saved to {transfer.final_path}"
+                    )
+                    self._history.append(summary)
+                message = str(transfer.final_path.name).encode("utf-8")[:4096]
+                ack = FILE_ACK_FIXED.pack(0, actual_digest, len(message)) + message
+                self.send_manager.enqueue(
+                    TYPE_FILE_ACK,
+                    transfer.stream_id,
+                    ack,
+                    PRIORITY_CONTROL,
+                )
+                self.console.async_write(summary)
+                return
         except (OSError, ProtocolError) as exc:
             transfer.state = "failed"
             transfer.error = str(exc)
             error_message = str(exc).encode("utf-8", errors="replace")[:4096]
-            ack = FILE_ACK_FIXED.pack(1, b"\x00" * 32, len(error_message)) + error_message
+            ack = FILE_ACK_FIXED.pack(1, actual_digest, len(error_message)) + error_message
             self.send_manager.enqueue(
                 TYPE_FILE_ACK,
                 transfer.stream_id,
@@ -822,7 +1041,8 @@ class TransferManager:
                 PRIORITY_CONTROL,
             )
             self.console.async_write(
-                f"接收失败 0x{transfer.stream_id:016x}: {transfer.filename}: {exc}"
+                f"Receive failed 0x{transfer.stream_id:016x}: "
+                f"{transfer.filename}: {exc}"
             )
         finally:
             if file_handle is not None:
@@ -837,6 +1057,7 @@ class TransferManager:
                     pass
 
 
+
 class PeerSession:
     def __init__(
         self,
@@ -849,6 +1070,7 @@ class PeerSession:
         chunk_size: int,
         local_name: str,
         peer_name: str,
+        local_log: LocalLog,
         text_handler: Optional[Callable[[str], None]] = None,
     ) -> None:
         self.sock = sock
@@ -856,7 +1078,7 @@ class PeerSession:
         self.local_name = local_name
         self.peer_name = peer_name
         self.stop_event = threading.Event()
-        self.console = Console(f"{local_name}> ")
+        self.console = Console(f"{local_name}> ", local_log)
         self._text_handler = text_handler
         self._channel = EncryptedChannel(sock, send_key, receive_key)
         self._send_manager = SendManager(
@@ -886,7 +1108,7 @@ class PeerSession:
     def send_text(self, text: str) -> None:
         encoded = text.encode("utf-8")
         if len(encoded) > 1024 * 1024:
-            raise ValueError("单条文本消息不能超过 1 MiB")
+            raise ValueError("A text message cannot exceed 1 MiB")
         self._send_manager.enqueue(TYPE_TEXT, TEXT_STREAM_ID, encoded, PRIORITY_TEXT)
 
     def send_files(self, paths: Iterable[str]) -> List[int]:
@@ -917,7 +1139,7 @@ class PeerSession:
             while not self.stop_event.is_set():
                 packet = self._channel.receive_packet()
                 if len(packet) < PACKET_HEADER.size:
-                    raise ProtocolError("协议包头过短")
+                    raise ProtocolError("Protocol packet header is too short")
                 packet_type, stream_id = PACKET_HEADER.unpack(
                     packet[:PACKET_HEADER.size]
                 )
@@ -930,7 +1152,7 @@ class PeerSession:
     def _dispatch(self, packet_type: int, stream_id: int, payload: bytes) -> None:
         if packet_type == TYPE_TEXT:
             if stream_id != TEXT_STREAM_ID:
-                raise ProtocolError("文本消息必须使用 stream_id 0")
+                raise ProtocolError("Text messages must use stream_id 0")
             text = payload.decode("utf-8", errors="replace")
             if self._text_handler is not None:
                 self._text_handler(text)
@@ -947,33 +1169,34 @@ class PeerSession:
         elif packet_type == TYPE_FILE_ACK:
             self._transfers.handle_ack(stream_id, payload)
         else:
-            raise ProtocolError(f"未知消息类型: 0x{packet_type:02x}")
+            raise ProtocolError(f"Unknown packet type: 0x{packet_type:02x}")
 
     def _fatal_error(self, exc: BaseException) -> None:
         if self.stop_event.is_set():
             return
-        self.console.async_write(f"连接终止: {exc}")
+        self.console.async_write(f"Connection terminated: {exc}")
         self.close()
 
 
 def run_command_loop(session: PeerSession) -> None:
     help_text = (
-        "命令:\n"
-        "  /send <文件1> [文件2 ...]  并发发送一个或多个文件\n"
-        "  /transfers                 查看传输状态\n"
-        "  /cancel <stream_id>        取消本端发送任务，支持十六进制\n"
-        "  /fingerprint               显示当前会话指纹\n"
-        "  /help                      显示帮助\n"
-        "  /quit                      关闭连接\n"
-        "直接输入其他内容即可发送文本消息。"
+        "Commands:\n"
+        "  /send <file1> [file2 ...]  Send one or more files concurrently\n"
+        "  /transfers                 Show transfer status\n"
+        "  /cancel <stream_id>        Cancel a local outbound stream\n"
+        "  /fingerprint               Show the current session fingerprint\n"
+        "  /help                      Show command help\n"
+        "  /quit                      Close the connection\n"
+        "Enter any other text to send a message. Paths with spaces may be quoted."
     )
     session.console.write(help_text)
     while not session.stop_event.is_set():
         try:
             line = input(session.console.prompt)
         except (EOFError, KeyboardInterrupt):
-            print()
+            session.console.write("")
             break
+        session.console.record_input(line)
         stripped = line.strip()
         if not stripped:
             continue
@@ -981,44 +1204,53 @@ def run_command_loop(session: PeerSession) -> None:
             try:
                 session.send_text(line)
             except (ValueError, ProtocolError) as exc:
-                session.console.write(f"发送消息失败: {exc}")
+                session.console.write(f"Failed to send message: {exc}")
             continue
 
         try:
-            parts = shlex.split(stripped)
+            parts = split_command_line(stripped)
         except ValueError as exc:
-            session.console.write(f"命令解析失败: {exc}")
+            session.console.write(f"Command parsing failed: {exc}")
             continue
+        if not parts:
+            continue
+
         command = parts[0].lower()
         if command == "/quit":
             break
         if command == "/help":
             session.console.write(help_text)
         elif command == "/fingerprint":
-            session.console.write(f"会话指纹: {session.fingerprint}")
+            session.console.write(f"Session fingerprint: {session.fingerprint}")
         elif command == "/transfers":
-            for status in session.transfer_status():
+            statuses = session.transfer_status()
+            for status in statuses:
                 session.console.write(status)
         elif command == "/send":
             if len(parts) < 2:
-                session.console.write("用法: /send <文件1> [文件2 ...]")
+                session.console.write("Usage: /send <file1> [file2 ...]")
             else:
                 session.send_files(parts[1:])
         elif command == "/cancel":
             if len(parts) != 2:
-                session.console.write("用法: /cancel <stream_id>")
+                session.console.write("Usage: /cancel <stream_id>")
                 continue
             try:
                 stream_id = int(parts[1], 0)
             except ValueError:
-                session.console.write("stream_id 必须是十进制或 0x 开头的十六进制")
+                session.console.write(
+                    "stream_id must be decimal or hexadecimal with a 0x prefix"
+                )
                 continue
             if not session.cancel_transfer(stream_id):
-                session.console.write(f"找不到可取消的发送流: 0x{stream_id:016x}")
+                session.console.write(
+                    f"No cancellable outbound stream found: 0x{stream_id:016x}"
+                )
         else:
-            session.console.write(f"未知命令: {command}，输入 /help 查看帮助")
+            session.console.write(
+                f"Unknown command: {command}. Enter /help for command help."
+            )
     session.close()
-
 
 def client_handshake(sock: socket.socket) -> Tuple[bytes, bytes, str]:
     client_private = X25519PrivateKey.generate()
@@ -1027,9 +1259,9 @@ def client_handshake(sock: socket.socket) -> Tuple[bytes, bytes, str]:
 
     response = recv_frame(sock)
     if len(response) != len(PROTOCOL_MAGIC) + PUBLIC_KEY_SIZE:
-        raise ProtocolError("服务器握手包长度错误")
+        raise ProtocolError("Invalid server handshake length")
     if response[:len(PROTOCOL_MAGIC)] != PROTOCOL_MAGIC:
-        raise ProtocolError("协议版本不匹配")
+        raise ProtocolError("Protocol version mismatch")
 
     server_public_bytes = response[len(PROTOCOL_MAGIC):]
     server_public = X25519PublicKey.from_public_bytes(server_public_bytes)
@@ -1044,35 +1276,52 @@ def client_handshake(sock: socket.socket) -> Tuple[bytes, bytes, str]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="XFM4：X25519 + ChaCha20-Poly1305 双向多路复用通信客户端"
+        description="XFM4 X25519 + ChaCha20-Poly1305 bidirectional multiplexed client"
     )
-    parser.add_argument("host", nargs="?", default="127.0.0.1", help="服务器地址")
-    parser.add_argument("--port", type=int, default=9000, help="服务器端口")
+    parser.add_argument("host", nargs="?", default="127.0.0.1", help="Server IPv4, IPv6, or hostname")
+    parser.add_argument("--port", type=int, default=9000, help="Server port")
     parser.add_argument(
         "--download-dir",
         default="client_downloads",
-        help="接收文件保存目录",
+        help="Directory for received files",
+    )
+    parser.add_argument(
+        "--log-dir",
+        default="logs",
+        help="Directory for timestamped local chat logs",
     )
     parser.add_argument(
         "--chunk-size-kib",
         type=int,
         default=DEFAULT_CHUNK_SIZE // 1024,
-        help="发送文件分块大小，范围 4-1024 KiB",
+        help="Outbound file chunk size, 4-1024 KiB",
     )
     args = parser.parse_args()
 
     chunk_size = args.chunk_size_kib * 1024
     if chunk_size < MIN_CHUNK_SIZE or chunk_size > MAX_CHUNK_SIZE:
-        parser.error("--chunk-size-kib 必须在 4 到 1024 之间")
+        parser.error("--chunk-size-kib must be between 4 and 1024")
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    log_directory = Path(args.log_dir).expanduser().resolve()
+    local_log = LocalLog(log_directory)
+    console = Console("", local_log)
+    sock: Optional[socket.socket] = None
+    server_host = strip_ipv6_brackets(args.host)
+
     try:
-        print(f"正在连接 {args.host}:{args.port} ...")
-        sock.settimeout(20)
-        sock.connect((args.host, args.port))
+        console.write(f"Local log: {local_log.path}")
+        console.write(f"Connecting to {format_endpoint((server_host, args.port))} ...")
+        sock = socket.create_connection((server_host, args.port), timeout=20)
+        peer_address = sock.getpeername()
+        peer_ip = normalize_ip_address(peer_address)
+        peer_endpoint = format_endpoint(peer_address)
+        console.write(f"Connected to {peer_endpoint}")
+
         send_key, receive_key, fingerprint = client_handshake(sock)
         sock.settimeout(None)
-        print(f"加密会话已建立，会话指纹: {fingerprint}")
+        console.write(
+            f"Encrypted session established with {peer_ip}. Fingerprint: {fingerprint}"
+        )
 
         session = PeerSession(
             sock=sock,
@@ -1082,17 +1331,21 @@ def main() -> None:
             local_stream_parity=1,
             download_dir=Path(args.download_dir).expanduser().resolve(),
             chunk_size=chunk_size,
-            local_name="客户端",
-            peer_name="服务器",
+            local_name="You",
+            peer_name=peer_ip,
+            local_log=local_log,
         )
         session.start()
         run_command_loop(session)
     except (OSError, ConnectionClosed, ProtocolError, ValueError) as exc:
-        print(f"连接失败: {exc}")
-        try:
-            sock.close()
-        except OSError:
-            pass
+        console.write(f"Connection failed: {exc}")
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+    finally:
+        local_log.close()
 
 
 if __name__ == "__main__":
